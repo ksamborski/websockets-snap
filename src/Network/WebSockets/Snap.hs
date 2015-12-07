@@ -13,21 +13,18 @@ import           Control.Concurrent.MVar       (MVar, newEmptyMVar, putMVar,
                                                 takeMVar)
 import           Control.Exception             (Exception (..),
                                                 SomeException (..), finally,
-                                                handle, throwIO, throwTo)
+                                                handle, throwIO, throwTo, catch)
 import           Control.Monad                 (forever)
-import           Control.Monad.Trans           (lift)
 import           Data.ByteString               (ByteString)
 import qualified Data.ByteString.Char8         as BC
 import qualified Data.ByteString.Lazy          as BL
-import qualified Data.Enumerator               as E
-import qualified Data.Enumerator.List          as EL
-import           Data.IORef                    (newIORef, readIORef, writeIORef)
+import qualified Data.ByteString.Builder       as BL
 import           Data.Typeable                 (Typeable, cast)
+import qualified System.IO.Streams             as Streams
 import qualified Network.WebSockets            as WS
 import qualified Network.WebSockets.Connection as WS
 import qualified Network.WebSockets.Stream     as WS
 import qualified Snap.Core                     as Snap
-import qualified Snap.Internal.Http.Types      as Snap
 import qualified Snap.Types.Headers            as Headers
 
 
@@ -51,26 +48,27 @@ instance Exception ServerAppDone where
 
 
 --------------------------------------------------------------------------------
-copyIterateeToMVar
-    :: ((Int -> Int) -> IO ())
+copyStreamToMVar
+    :: Streams.InputStream ByteString
+    -> ((Int -> Int) -> IO ())
     -> MVar Chunk
-    -> E.Iteratee ByteString IO ()
-copyIterateeToMVar tickle mvar = E.catchError go handler
+    -> IO ()
+copyStreamToMVar readEnd tickle mvar = catch go handler
   where
     go = do
-        mbs <- EL.head
+        mbs <- Streams.read readEnd
         case mbs of
             Just x  -> do
-                lift (tickle (max 60))
-                lift (putMVar mvar (Chunk x))
+                tickle (max 60)
+                putMVar mvar (Chunk x)
                 go
-            Nothing -> lift (putMVar mvar Eof)
+            Nothing -> putMVar mvar Eof
 
     handler se@(SomeException e) = case cast e of
         -- Clean exit
         Just ServerAppDone -> return ()
         -- Actual error
-        Nothing            -> lift $ putMVar mvar $ Error se
+        Nothing            -> putMVar mvar $ Error se
 
 
 --------------------------------------------------------------------------------
@@ -86,23 +84,12 @@ copyMVarToStream mvar = return go
 
 
 --------------------------------------------------------------------------------
-copyStreamToIteratee
-    :: E.Iteratee ByteString IO ()
-    -> IO (Maybe BL.ByteString -> IO ())
-copyStreamToIteratee iteratee0 = do
-    ref <- newIORef =<< E.runIteratee iteratee0
-    return (go ref)
+writer :: Streams.OutputStream BL.Builder
+       -> (Maybe BL.ByteString -> IO ())
+writer writeEnd = go
   where
-    go _   Nothing   = return ()
-    go ref (Just bl) = do
-        step <- readIORef ref
-        case step of
-            E.Continue f              -> do
-                let chunks = BL.toChunks bl
-                step' <- E.runIteratee $ f $ E.Chunks chunks
-                writeIORef ref step'
-            E.Yield () _              -> throwIO WS.ConnectionClosed
-            E.Error (SomeException e) -> throwIO e
+    go Nothing   = return ()
+    go (Just bl) = Streams.write (Just $ BL.lazyByteString bl) writeEnd
 
 
 --------------------------------------------------------------------------------
@@ -126,13 +113,13 @@ runWebSocketsSnapWith
     -> m ()
 runWebSocketsSnapWith options app = do
     rq <- Snap.getRequest
-    Snap.escapeHttp $ \tickle writeEnd -> do
+    Snap.escapeHttp $ \tickle readEnd writeEnd -> do
 
-        thisThread <- lift myThreadId
-        mvar       <- lift newEmptyMVar
-        parse      <- lift $ copyMVarToStream mvar
-        write      <- lift $ copyStreamToIteratee writeEnd
-        stream     <- lift $ WS.makeStream parse write
+        let write  = writer writeEnd
+        thisThread <- myThreadId
+        mvar       <- newEmptyMVar
+        parse      <- copyMVarToStream mvar
+        stream     <- WS.makeStream parse write
 
         let options' = options
                     { WS.connectionOnPong = do
@@ -147,10 +134,10 @@ runWebSocketsSnapWith options app = do
                     , WS.pendingStream   = stream
                     }
 
-        _ <- lift $ forkIO $ finally (app pc) $ do
+        _ <- forkIO $ finally (app pc) $ do
             WS.close stream
             throwTo thisThread ServerAppDone
-        copyIterateeToMVar tickle mvar
+        copyStreamToMVar readEnd tickle mvar
 
 
 --------------------------------------------------------------------------------
