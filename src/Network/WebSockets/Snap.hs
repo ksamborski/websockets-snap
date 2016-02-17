@@ -19,6 +19,7 @@ import           Data.ByteString               (ByteString)
 import qualified Data.ByteString.Char8         as BC
 import qualified Data.ByteString.Lazy          as BL
 import qualified Data.ByteString.Builder       as BL
+import qualified Data.ByteString.Builder.Extra as BL
 import           Data.Typeable                 (Typeable, cast)
 import qualified System.IO.Streams             as Streams
 import qualified Network.WebSockets            as WS
@@ -89,7 +90,9 @@ writer :: Streams.OutputStream BL.Builder
 writer writeEnd = go
   where
     go Nothing   = return ()
-    go (Just bl) = Streams.write (Just $ BL.lazyByteString bl) writeEnd
+    go (Just bl) = do
+      Streams.write (Just $ BL.lazyByteString bl) writeEnd 
+      Streams.write (Just $ BL.flush) writeEnd 
 
 
 --------------------------------------------------------------------------------
